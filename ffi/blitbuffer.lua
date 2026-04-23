@@ -723,7 +723,14 @@ end
 -- so, when flipping the buffer for Android's window, ffi/framebuffer_android.lua
 -- just does an invertblitFrom instead of a blitFrom if the screen bb is flagged as inverted,
 -- as the only way this could happen is with nightmode enabled.
-if os.getenv("IS_ANDROID") then
+if os.getenv("IS_ANDROID") or os.getenv("KO_IOS") == "1" then
+    -- iOS uses the same trick as Android: ignore the inverse flag for
+    -- CBB eligibility so KOReader's UI drawing always takes the fast C
+    -- path. We're stuck on interpreter-only LuaJIT here, so falling
+    -- back to the Lua blitter (what stock canUseCbb does in night mode)
+    -- grinds the UI to a halt. framebuffer_SDL3.lua handles the actual
+    -- inversion at SDL_UpdateTexture time via invertblitFrom into a
+    -- scratch buffer.
     BB_mt.__index.canUseCbbTogether = BB.getUseCBB
     BB_mt.__index.canUseCbb = BB.getUseCBB
 else

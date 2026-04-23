@@ -353,6 +353,63 @@ function util.runInSubProcess(func, with_pipe, double_fork)
             parent_write_fd, child_read_fd = pipe[1], pipe[0]
         end
     end
+    -- iOS: fork() is forbidden by the sandbox (returns -1). Run the
+    -- work inline on the calling thread instead and hand back a sentinel
+    -- pid. waitpid on a non-existent pid returns -1 (ECHILD), which
+    -- isSubProcessDone() treats as "already done" — so callers like
+    -- coverbrowser see the task complete without ever knowing it didn't
+    -- actually run in a child. Trade-off: the UI is blocked for the
+    -- duration of `func` (typically book-metadata extraction).
+    --
+    -- For with_pipe callers (ReaderThumbnail), the parent reads from
+    -- parent_read_fd asynchronously. Inline write() to a real pipe
+    -- would deadlock on payloads bigger than the 64KB pipe buffer
+    -- (thumbnails are ~200KB), so we redirect through a temp file:
+    -- "child" writes to the temp fd, we hand the parent a separate
+    -- read fd opened on the same file, then unlink so the file is
+    -- collected when both fds close.
+    --
+    -- We deliberately bail out *before* the before-fork hooks below: we
+    -- never fork on iOS, so subsystem stop/restart isn't needed.
+    if ffi.os == "OSX" and os.getenv("KO_IOS") == "1" then
+        local parent_fd_for_caller
+        if with_pipe then
+            -- Close the pipe we already created — we don't need it.
+            C.close(parent_read_fd)
+            C.close(child_write_fd)
+            -- mkstemp + unlink-after-open gives us a self-cleaning
+            -- temp file with both ends already-fd-backed.
+            ffi.cdef[[ int mkstemp(char *); int unlink(const char *); ]]
+            -- iOS sandboxes apps; use $TMPDIR (the per-app tmp dir).
+            local template = (os.getenv("TMPDIR") or "/tmp") .. "/koreader-pipeXXXXXX"
+            -- Trim trailing slash if TMPDIR has one (NSTemporaryDirectory does).
+            template = template:gsub("//+", "/")
+            local tmpl = ffi.new("char[?]", #template + 1, template)
+            child_write_fd = C.mkstemp(tmpl)
+            if child_write_fd < 0 then
+                return false, "mkstemp failed: "..ffi.string(C.strerror(ffi.errno()))
+            end
+            parent_fd_for_caller = C.open(tmpl, 0)  -- O_RDONLY
+            if parent_fd_for_caller < 0 then
+                C.close(child_write_fd)
+                C.unlink(tmpl)
+                return false, "reopen failed: "..ffi.string(C.strerror(ffi.errno()))
+            end
+            C.unlink(tmpl)  -- file lives on via the open fds
+        end
+        local ok, err = xpcall(function()
+            func(C.getpid(), child_write_fd)
+        end, debug.traceback)
+        if not ok then
+            print("error in inline 'subprocess' (iOS):", err)
+        end
+        if child_write_fd then
+            C.close(child_write_fd)
+        end
+        -- Pid that's guaranteed to be ours, so waitpid will return ECHILD
+        -- → isSubProcessDone() → true.
+        return tonumber(C.getpid()), parent_fd_for_caller
+    end
     -- Run before-fork hooks in the parent.  Callers (e.g. the SDL backend) use
     -- this to stop subsystem threads that may hold glibc malloc arena locks.
     -- If such a thread is mid-malloc when fork() is called, glibc's atfork
