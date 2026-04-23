@@ -3,6 +3,15 @@ local SDL = require("ffi/SDL3")
 local BB = require("ffi/blitbuffer")
 local util = require("ffi/util")
 local ffi = require("ffi")
+
+-- SDL_FRect's struct body isn't in SDL3_h.lua (only the typedef);
+-- declare it here so we can construct SDL_RenderTexture dest rects.
+ffi.cdef[[
+    struct SDL_FRect { float x; float y; float w; float h; };
+    bool SDL_SetRenderDrawColor(struct SDL_Renderer *, unsigned char r,
+                                unsigned char g, unsigned char b,
+                                unsigned char a);
+]]
 local framebuffer = {
     -- this blitbuffer will be used when we use refresh emulation
     sdl_bb = nil,
@@ -50,6 +59,16 @@ function framebuffer:resize(w, h)
         h = SDL.win_h
     end
 
+    -- iOS rotation / status-bar visibility changes both the window
+    -- size and the safe-area insets; re-query so the bb is re-sized to
+    -- the new safe area in the next _newBB call below.
+    SDL.applyIOSSafeArea(w, h)
+    if SDL.safe_left ~= 0 or SDL.safe_top ~= 0
+            or SDL.safe_right ~= 0 or SDL.safe_bottom ~= 0 then
+        w = SDL.w
+        h = SDL.h
+    end
+
     if not self.dummy then
         self:_newBB(w, h)
         SDL.w = w
@@ -75,6 +94,10 @@ function framebuffer:_newBB(w, h)
     local inverse
 
     if self.sdl_bb then self.sdl_bb:free() end
+    if self.invert_scratch_bb then
+        self.invert_scratch_bb:free()
+        self.invert_scratch_bb = nil
+    end
     if self.bb then
         rotation = self.bb:getRotation()
         inverse = self.bb:getInverse() == 1
@@ -113,6 +136,24 @@ function framebuffer:_render(bb, x, y, w, h)
     local bb_rect = bb:viewport(x, y, w, h)
     local sdl_rect = SDL.rect(px, py, pw, ph)
 
+    -- iOS night mode: bb pixels are non-inverted (CBB has been told to
+    -- ignore the inverse flag for performance), so invert the dirty
+    -- region into a scratch buffer right before SDL copies it.
+    -- invertblitFrom is a fast C XOR; doing this here keeps UI drawing
+    -- on the CBB fast path.
+    if bb:getInverse() == 1 then
+        if not self.invert_scratch_bb
+                or self.invert_scratch_bb:getWidth() ~= bb:getWidth()
+                or self.invert_scratch_bb:getHeight() ~= bb:getHeight()
+                or self.invert_scratch_bb:getType() ~= bb:getType() then
+            if self.invert_scratch_bb then self.invert_scratch_bb:free() end
+            self.invert_scratch_bb = BB.new(bb:getWidth(), bb:getHeight(), bb:getType())
+        end
+        local scratch_rect = self.invert_scratch_bb:viewport(x, y, w, h)
+        scratch_rect:invertblitFrom(bb_rect)
+        bb_rect = scratch_rect
+    end
+
     if not bb_emu then
         SDL.SDL.SDL_UpdateTexture(SDL.texture, sdl_rect, bb_rect.data, bb_rect.stride)
     else
@@ -128,8 +169,26 @@ function framebuffer:_render(bb, x, y, w, h)
         SDL.SDL.SDL_UpdateTexture(SDL.texture, sdl_rect, vbuf, pw * 4)
     end
 
+    -- Match the bezel color to night-mode state so the letterbox
+    -- bars blend with KOReader's UI: white in normal mode, black in
+    -- night mode. bb:getInverse() == 1 when night mode is on.
+    if bb:getInverse() == 1 then
+        SDL.SDL.SDL_SetRenderDrawColor(SDL.renderer, 0, 0, 0, 0xFF)
+    else
+        SDL.SDL.SDL_SetRenderDrawColor(SDL.renderer, 0xFF, 0xFF, 0xFF, 0xFF)
+    end
     SDL.SDL.SDL_RenderClear(SDL.renderer)
-    SDL.SDL.SDL_RenderTexture(SDL.renderer, SDL.texture, nil, nil)
+    if SDL.safe_left ~= 0 or SDL.safe_top ~= 0
+            or SDL.safe_right ~= 0 or SDL.safe_bottom ~= 0 then
+        -- Render the bb into the safe-area sub-rect of the window so
+        -- the iOS notch / home indicator don't sit on top of the UI.
+        -- SDL_RenderTexture takes SDL_FRect (floats); RenderClear above
+        -- has already painted the bezel area to match night-mode state.
+        local dst = ffi.new("SDL_FRect", SDL.safe_left, SDL.safe_top, SDL.w, SDL.h)
+        SDL.SDL.SDL_RenderTexture(SDL.renderer, SDL.texture, nil, dst)
+    else
+        SDL.SDL.SDL_RenderTexture(SDL.renderer, SDL.texture, nil, nil)
+    end
     SDL.SDL.SDL_RenderPresent(SDL.renderer)
 end
 
@@ -165,6 +224,10 @@ function framebuffer:setWindowIcon(icon)
 end
 
 function framebuffer:close()
+    if self.invert_scratch_bb then
+        self.invert_scratch_bb:free()
+        self.invert_scratch_bb = nil
+    end
     SDL.SDL.SDL_DestroyRenderer(SDL.renderer)
     SDL.SDL.SDL_Quit()
 end

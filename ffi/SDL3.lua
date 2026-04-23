@@ -161,7 +161,49 @@ function S.open(w, h, x, y)
         S.w = S.win_w
         S.h = S.win_h
     end
+    -- Default: no safe-area inset (entire window is usable).
+    S.window_pixel_w = S.w
+    S.window_pixel_h = S.h
+    S.safe_left = 0
+    S.safe_top = 0
+    S.safe_right = 0
+    S.safe_bottom = 0
+
+    if os.getenv("KO_IOS") == "1" then
+        ffi.cdef[[
+            void ko_ios_get_safe_area_pixels(int *t, int *r, int *b, int *l);
+        ]]
+        S.applyIOSSafeArea(S.window_pixel_w, S.window_pixel_h)
+    end
+
     S.texture = S.createTexture()
+end
+
+-- Query iOS' UIWindow.safeAreaInsets and recompute S.w/S.h to letterbox
+-- the bb inside the notch/home-indicator bezel. Called from S.open()
+-- and again from framebuffer:resize() (e.g. on device rotation).
+-- Returns true if the inset values changed.
+function S.applyIOSSafeArea(window_w, window_h)
+    if os.getenv("KO_IOS") ~= "1" then return false end
+    local t = ffi.new("int[1]", 0)
+    local r = ffi.new("int[1]", 0)
+    local b = ffi.new("int[1]", 0)
+    local l = ffi.new("int[1]", 0)
+    ffi.C.ko_ios_get_safe_area_pixels(t, r, b, l)
+    local new_top, new_right = tonumber(t[0]), tonumber(r[0])
+    local new_bottom, new_left = tonumber(b[0]), tonumber(l[0])
+    local changed = new_top ~= S.safe_top or new_right ~= S.safe_right
+        or new_bottom ~= S.safe_bottom or new_left ~= S.safe_left
+        or window_w ~= S.window_pixel_w or window_h ~= S.window_pixel_h
+    S.window_pixel_w = window_w
+    S.window_pixel_h = window_h
+    S.safe_top = new_top
+    S.safe_right = new_right
+    S.safe_bottom = new_bottom
+    S.safe_left = new_left
+    S.w = window_w - new_left - new_right
+    S.h = window_h - new_top - new_bottom
+    return changed
 end
 
 function S.startTextInput()
@@ -535,6 +577,27 @@ function S.waitForEvent(sec, usec)
     local scale_x = S.w / S.win_w
     local scale_y = S.h / S.win_h
 
+    -- Convert a normalized finger coordinate (0..1 over the full window)
+    -- into bb (safe-area) pixel coordinates. On platforms without a
+    -- safe-area inset (everywhere but iOS) this collapses to the
+    -- previous `tfinger.x * S.w` behaviour.
+    --
+    -- Taps that land inside the bezel (under the notch / over the home
+    -- indicator) get clamped to the nearest canvas edge so they still
+    -- register on the closest UI element instead of being dropped.
+    local function fingerToBBX(nx)
+        local x = nx * S.window_pixel_w - S.safe_left
+        if x < 0 then return 0 end
+        if x >= S.w then return S.w - 1 end
+        return x
+    end
+    local function fingerToBBY(ny)
+        local y = ny * S.window_pixel_h - S.safe_top
+        if y < 0 then return 0 end
+        if y >= S.h then return S.h - 1 end
+        return y
+    end
+
     -- if we got an event, examine it here and generate events for koreader
     if event.type == SDL.SDL_EVENT_KEY_DOWN then
         genEmuEvent(C.EV_KEY, event.key.key, 1)
@@ -607,7 +670,7 @@ function S.waitForEvent(sec, usec)
 
         if is_finger then
             slot = getFingerSlot(event)
-            genTouchMoveEvent(event, slot, event.tfinger.x * S.w, event.tfinger.y * S.h)
+            genTouchMoveEvent(event, slot, fingerToBBX(event.tfinger.x), fingerToBBY(event.tfinger.y))
         else
             if pointers[0] and pointers[0].down then
                 slot = 0 -- left mouse button down
@@ -639,8 +702,8 @@ function S.waitForEvent(sec, usec)
             return false, C.EINTR
         end
 
-        local x = is_finger and event.tfinger.x * S.w or event.button.x * scale_x
-        local y = is_finger and event.tfinger.y * S.h or event.button.y * scale_y
+        local x = is_finger and fingerToBBX(event.tfinger.x) or event.button.x * scale_x
+        local y = is_finger and fingerToBBY(event.tfinger.y) or event.button.y * scale_y
         genTouchUpEvent(event, slot, x, y)
         if is_finger then
             finger_pointers[tonumber(event.tfinger.fingerID)] = nil
@@ -664,8 +727,8 @@ function S.waitForEvent(sec, usec)
         else -- SDL_BUTTON_LEFT
             slot = 0
         end
-        local x = is_finger and event.tfinger.x * S.w or event.button.x * scale_x
-        local y = is_finger and event.tfinger.y * S.h or event.button.y * scale_y
+        local x = is_finger and fingerToBBX(event.tfinger.x) or event.button.x * scale_x
+        local y = is_finger and fingerToBBY(event.tfinger.y) or event.button.y * scale_y
         if not is_finger then
             setPointerDownState(slot, true, x, y)
         end
@@ -691,6 +754,17 @@ function S.waitForEvent(sec, usec)
              or event.type == SDL.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED
              or event.type == SDL.SDL_EVENT_WINDOW_MOVED) then
         genEmuEvent(C.EV_SDL, event.type, event.window)
+    elseif event.type == SDL.SDL_EVENT_DID_ENTER_FOREGROUND
+            or event.type == SDL.SDL_EVENT_WILL_ENTER_FOREGROUND
+            or event.type == SDL.SDL_EVENT_DID_ENTER_BACKGROUND
+            or event.type == SDL.SDL_EVENT_WILL_ENTER_BACKGROUND
+            or event.type == SDL.SDL_EVENT_LOW_MEMORY
+            or event.type == SDL.SDL_EVENT_TERMINATING then
+        -- iOS app lifecycle: forward to the device layer so it can
+        -- force a refresh on resume (the SDL renderer/texture state
+        -- can be invalidated while backgrounded, leaving the screen
+        -- looking frozen until something redraws).
+        genEmuEvent(C.EV_SDL, event.type, nil)
 
     --- Gamepad support ---
     -- For debugging it can be helpful to use:
