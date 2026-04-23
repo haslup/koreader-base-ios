@@ -191,6 +191,10 @@ else ifeq ($(TARGET), ios)
 	SDL=builtin
 	DARWIN = 1
 	IOS = 1
+	# Monolithic build: collapse the ~30 thirdparty dylibs into a single
+	# libkoreader-monolibtic.dylib so iOS launch only does one dlopen +
+	# code-signature pass instead of dozens.
+	MONOLIBTIC ?= 1
 	IOS_PLATFORM ?= iphoneos
 	IOS_ARCH ?= arm64
 	IOS_DEPLOYMENT_TARGET ?= 14.0
@@ -1046,7 +1050,9 @@ set(GLIBC_VERSION_MAX  $(GLIBC_VERSION_MAX))
 
 # Platform flags.
 set(ANDROID        $(ANDROID))
+set(APPLE          $(DARWIN))
 set(CERVANTES      $(CERVANTES))
+set(IOS            $(IOS))
 set(KINDLE         $(KINDLE))
 set(KOBO           $(KOBO))
 set(LEGACY         $(LEGACY))
