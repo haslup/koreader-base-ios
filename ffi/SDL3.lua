@@ -688,8 +688,18 @@ function S.waitForEvent(sec, usec)
             end
         end
     elseif event.type == SDL.SDL_EVENT_MOUSE_BUTTON_UP and shouldHandleMousePointer(event.button.which)
-        or event.type == SDL.SDL_EVENT_FINGER_UP then
+        or event.type == SDL.SDL_EVENT_FINGER_UP
+        or event.type == SDL.SDL_EVENT_FINGER_CANCELED then
+        -- iOS sends FINGER_CANCELED when a system gesture (Control Center,
+        -- the home indicator, the dock) takes over a touch. Treat it as a
+        -- finger-up so the gesture detector isn't left with a contact down,
+        -- which looks like a frozen app.
         local is_finger = event.type == SDL.SDL_EVENT_FINGER_UP
+            or event.type == SDL.SDL_EVENT_FINGER_CANCELED
+        if is_finger and not finger_pointers[tonumber(event.tfinger.fingerID)] then
+            -- Never saw the matching FINGER_DOWN; nothing to release.
+            return false, C.EINTR
+        end
         local slot
         if is_finger then
             slot = getFingerSlot(event)
